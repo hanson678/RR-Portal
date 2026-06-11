@@ -75,7 +75,7 @@ def _get_schedule_info():
 
 
 def _run_scan():
-    """运行 scan_hy_items.py 重建货号映射表"""
+    """运行 scan_hy_items.py 全量重建货号映射表"""
     script = os.path.join(APP_DIR, 'scan_hy_items.py')
     # Windows上隐藏CMD窗口
     kwargs = {}
@@ -87,11 +87,69 @@ def _run_scan():
             capture_output=True, text=True, timeout=600, encoding='utf-8',
             **kwargs
         )
-        logger.info(f'[河源] 重建映射表: rc={result.returncode}')
+        logger.info(f'[河源] 全量重建映射表: rc={result.returncode}')
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
         logger.error(f'[河源] 扫描失败: {e}')
         return False, '', str(e)
+
+
+def _load_item_map():
+    """加载现有映射表"""
+    map_path = os.path.join(DATA_DIR, 'hy_item_map.json')
+    if os.path.exists(map_path):
+        try:
+            with open(map_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_item_map(mapping):
+    """保存映射表"""
+    map_path = os.path.join(DATA_DIR, 'hy_item_map.json')
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(map_path, 'w', encoding='utf-8') as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+
+def _incremental_scan(filepaths):
+    """增量扫描：只扫描指定文件，merge到现有映射表"""
+    sys.path.insert(0, APP_DIR)
+    from scan_hy_items import scan_single
+
+    mapping = _load_item_map()
+    total_new = 0
+    for fpath in filepaths:
+        fn = os.path.basename(fpath)
+        try:
+            file_map = scan_single(fpath)
+            for k, entries in file_map.items():
+                for entry in entries:
+                    mapping.setdefault(k, [])
+                    if entry not in mapping[k]:
+                        mapping[k].append(entry)
+                        total_new += 1
+        except Exception as e:
+            logger.warning(f'[河源] 增量扫描失败 {fn}: {e}')
+    _save_item_map(mapping)
+    logger.info(f'[河源] 增量扫描: {len(filepaths)}个文件, 新增{total_new}条')
+    return len(mapping)
+
+
+def _remove_file_from_map(filename):
+    """从映射表中移除指定文件的所有条目"""
+    mapping = _load_item_map()
+    to_delete = []
+    for k, entries in mapping.items():
+        mapping[k] = [e for e in entries if e.get('file') != filename]
+        if not mapping[k]:
+            to_delete.append(k)
+    for k in to_delete:
+        del mapping[k]
+    _save_item_map(mapping)
+    return len(mapping)
 
 
 # ========== 基于文件的待处理订单缓存（支持多worker/重启不丢失） ==========
@@ -235,17 +293,19 @@ def upload_schedules():
     if not saved:
         return jsonify({'error': '没有有效的Excel文件'}), 400
 
-    ok, stdout, stderr = _run_scan()
+    # 增量扫描：只扫描新上传的文件（而非全量重建）
+    new_paths = [os.path.join(SCHEDULE_DIR, fn) for fn in saved]
+    item_count = _incremental_scan(new_paths)
     info = _get_schedule_info()
 
-    logger.info(f'[河源] 上传排期文件: {saved}')
+    logger.info(f'[河源] 上传排期文件(增量): {saved}')
     return jsonify({
         'ok': True,
         'uploaded': saved,
         'file_count': info['file_count'],
         'item_count': info['item_count'],
-        'scan_ok': ok,
-        'msg': f'已上传{len(saved)}个排期文件，映射表已{"重建" if ok else "重建失败"}',
+        'scan_ok': True,
+        'msg': f'已上传{len(saved)}个排期文件，映射表已更新（{info["item_count"]}个货号）',
     })
 
 
@@ -261,15 +321,83 @@ def delete_schedule():
     if not os.path.exists(filepath):
         return jsonify({'error': '文件不存在'}), 404
     os.remove(filepath)
-    _run_scan()
+    # 增量移除：从映射表中清除该文件的条目（不全量重扫）
+    _remove_file_from_map(filename)
     info = _get_schedule_info()
-    logger.info(f'[河源] 删除排期文件: {filename}')
+    logger.info(f'[河源] 删除排期文件(增量): {filename}')
     return jsonify({
         'ok': True,
         'msg': f'已删除 {filename}',
         'file_count': info['file_count'],
         'item_count': info['item_count'],
     })
+
+
+@app.route('/api/hy-delete-all-schedules', methods=['POST'])
+def delete_all_schedules():
+    """一键清空所有排期文件"""
+    # 先杀掉正在运行的scan子进程（释放文件锁）
+    if os.name == 'nt':
+        import signal
+        try:
+            out = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq python.exe', '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            ).stdout
+            my_pid = os.getpid()
+            for line in out.strip().split('\n'):
+                if 'python' in line.lower():
+                    parts = line.strip('"').split('","')
+                    if len(parts) >= 2:
+                        pid = int(parts[1])
+                        if pid != my_pid:
+                            try:
+                                os.kill(pid, signal.SIGTERM)
+                            except (ProcessLookupError, PermissionError):
+                                pass
+        except Exception:
+            pass
+        time.sleep(1)
+
+    deleted = []
+    failed = []
+    for f in os.listdir(SCHEDULE_DIR):
+        if f.endswith(('.xlsx', '.xls')) and not f.startswith('~$'):
+            fpath = os.path.join(SCHEDULE_DIR, f)
+            try:
+                os.remove(fpath)
+                deleted.append(f)
+            except PermissionError:
+                failed.append((f, fpath))
+
+    # 重试被锁的文件（更长等待）
+    if failed:
+        time.sleep(3)
+        still_failed = []
+        for f, fpath in failed:
+            try:
+                os.remove(fpath)
+                deleted.append(f)
+            except Exception:
+                still_failed.append(f)
+        failed = still_failed
+
+    # 清空映射表
+    map_path = os.path.join(DATA_DIR, 'hy_item_map.json')
+    if not failed:
+        with open(map_path, 'w', encoding='utf-8') as fp:
+            json.dump({}, fp)
+    else:
+        _run_scan()
+
+    info = _get_schedule_info()
+    logger.info(f'[河源] 一键清空排期: 删除{len(deleted)}个, 剩余{info["file_count"]}个')
+    msg = f'已清空{len(deleted)}个排期文件'
+    if failed:
+        msg += f'（{len(failed)}个文件被占用，请稍后重试）'
+    return jsonify({'ok': True, 'msg': msg, 'deleted': len(deleted),
+                    'file_count': info['file_count'], 'item_count': info['item_count']})
 
 
 @app.route('/api/hy-rescan', methods=['POST'])

@@ -115,6 +115,58 @@ def scan(schedule_dir):
     return mapping
 
 
+def scan_single(fpath):
+    """扫描单个排期文件，返回 {item_key: [{file, sheet, ...}]}"""
+    fn = os.path.basename(fpath)
+    mapping = {}
+
+    if detect_fy_file(fpath):
+        return scan_fy_items(fpath)
+
+    try:
+        with _openpyxl_autofilter_patch():
+            wb = openpyxl.load_workbook(fpath, read_only=True, data_only=True)
+    except Exception as e:
+        print(f'[ERR] {fn}: {e}')
+        return {}
+
+    targets = _pick_target_sheets(wb.sheetnames)
+    if not targets:
+        wb.close()
+        return {}
+
+    for sn in targets:
+        ws = wb[sn]
+        header_row = None
+        for r in range(1, 8):
+            for c in range(1, 20):
+                if '产品货号' in str(ws.cell(r, c).value or ''):
+                    header_row = r
+                    break
+            if header_row:
+                break
+        if not header_row:
+            continue
+        empty = 0
+        for r in range(header_row + 1, 5000):
+            v = ws.cell(r, 7).value
+            if not v:
+                empty += 1
+                if empty > 30:
+                    break
+                continue
+            empty = 0
+            s = re.sub(r'[\s\n]+', '', str(v)).strip().upper()
+            if not s or not re.match(r'\d', s):
+                continue
+            entry = {'file': fn, 'sheet': sn}
+            mapping.setdefault(s, [])
+            if entry not in mapping[s]:
+                mapping[s].append(entry)
+    wb.close()
+    return mapping
+
+
 def main():
     schedule_dir = sys.argv[1] if len(sys.argv) > 1 else ''
 
